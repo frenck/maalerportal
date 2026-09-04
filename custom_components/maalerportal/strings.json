@@ -67,9 +67,6 @@
       "min_flow": {
         "name": "Min flow"
       },
-      "acoustic_noise": {
-        "name": "Acoustic noise"
-      },
       "price_per_unit": {
         "name": "Price per unit"
       },
@@ -126,60 +123,48 @@
       },
       "virtual_meter": {
         "name": "Virtual meter"
+      },
+      "last_api_contact": {
+        "name": "Last contact with Målerportal"
+      },
+      "last_meter_reading": {
+        "name": "Last reading from meter"
       }
     }
   },
   "config": {
     "abort": {
-      "already_configured": "Device is already configured"
+      "already_configured": "Device is already configured",
+      "reauth_successful": "Authentication updated",
+      "reconfigure_successful": "API key updated"
     },
     "error": {
       "cannot_connect": "Failed to connect",
-      "invalid_auth": "Wrong email and/or password",
-      "invalid_code": "Invalid verification code. Please try again.",
-      "invalid_code_format": "Code must be 6 digits",
-      "no_2fa_methods": "Two-factor authentication required but no methods available",
+      "invalid_api_key": "Invalid API key",
       "rate_limit": "Rate limit exceeded. Please try again later.",
       "unknown": "Unexpected error",
-      "user_not_found": "No account found with this email",
-      "passkey_only": "This account uses passkey login which is not supported in Home Assistant",
       "no_meters": "No meters found on your account. Please add meters via the Målerportal consumer app first."
     },
     "step": {
       "user": {
-        "title": "Log in to Målerportal",
-        "description": "Enter your email address to continue",
+        "title": "Connect to Målerportal",
+        "description": "Paste an API key from the Målerportal consumer app. You can create one under Menu → Smart Home → Create API key.",
         "data": {
-          "email": "Email"
+          "api_key": "API key"
         }
       },
-      "password": {
-        "title": "Enter password",
-        "description": "Logging in as {email}",
+      "reauth_confirm": {
+        "title": "Update Målerportal API key",
+        "description": "Your API key is no longer valid. Paste a new key from the Målerportal consumer app under Menu → Smart Home → Create API key.",
         "data": {
-          "password": "Password"
+          "api_key": "API key"
         }
       },
-      "2fa_choice": {
-        "title": "Two-factor authentication",
-        "description": "Choose how to verify your identity",
-        "menu_options": {
-          "totp": "Authenticator app",
-          "email": "Email code"
-        }
-      },
-      "2fa_totp": {
-        "title": "Authenticator app",
-        "description": "Enter the 6-digit code from your authenticator app",
+      "reconfigure": {
+        "title": "Replace Målerportal API key",
+        "description": "Paste a new API key from the Målerportal consumer app under Menu → Smart Home → Create API key.",
         "data": {
-          "code": "Verification code"
-        }
-      },
-      "2fa_email": {
-        "title": "Email verification",
-        "description": "A 6-digit code has been sent to {email}. Enter it below.",
-        "data": {
-          "code": "Verification code"
+          "api_key": "API key"
         }
       },
       "entity_selection": {

@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import re
-from typing import Any, Optional, Union
+from typing import Any, Optional
 import aiohttp
 
 from homeassistant.components.sensor import (
@@ -19,34 +19,42 @@ from homeassistant.components.recorder.models import (
     StatisticMeanType,
 )
 from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
     async_import_statistics,
     get_last_statistics,
-    statistics_during_period,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    EntityCategory,
     UnitOfEnergy,
     UnitOfVolume,
     UnitOfTemperature,
     UnitOfTime,
-    UnitOfFrequency,
     UnitOfPower,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import Throttle
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import DOMAIN, DEFAULT_POLLING_INTERVAL
+from homeassistant.helpers.storage import Store
+
+from .const import (
+    API_TIMEOUT_SECONDS,
+    DEFAULT_POLLING_INTERVAL,
+    DOMAIN,
+    STALE_ENTITIES_STORAGE_VERSION,
+    consumer_app_url,
+    stale_entities_storage_key,
+)
+from .units import LITERS_PER_HOUR, resolve_unit, statistics_unit_class
 
 # Import event firing function - will be available after __init__ loads
 EVENT_METER_UPDATED = f"{DOMAIN}_meter_updated"
 
 _LOGGER = logging.getLogger(__name__)
-
 
 def get_polling_interval(config: ConfigEntry) -> timedelta:
     """Get polling interval from config options."""
@@ -66,11 +74,13 @@ async def async_setup_entry(
     polling_interval = get_polling_interval(config)
     
     sensors = []
+    # Installations whose counter list we actually got; only those are safe to prune.
+    fetched_installation_ids: set[str] = set()
 
     for installation in installations:
         try:
             # Fetch meter counters to determine what sensors to create
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
                 try:
                     response = await session.get(
                         f"{smarthome_base_url}/installations/{installation['installationId']}/readings/latest",
@@ -86,6 +96,10 @@ async def async_setup_entry(
                             installation, api_key, smarthome_base_url, meter_counters, polling_interval
                         )
                         sensors.extend(installation_sensors)
+                        # Only a non-empty counter list proves the API knows this
+                        # installation. Pruning must never act on an empty answer.
+                        if meter_counters:
+                            fetched_installation_ids.add(installation["installationId"])
                     else:
                         _LOGGER.warning("Failed to fetch meter data for installation %s (HTTP %s), creating basic sensor", 
                                       installation["installationId"], response.status)
@@ -102,7 +116,51 @@ async def async_setup_entry(
             # Fallback to basic sensor
             sensors.append(MaalerportalBasicSensor(installation, api_key, smarthome_base_url, polling_interval))
 
+    await _async_remove_stale_entities(hass, config, sensors, fetched_installation_ids)
     async_add_entities(sensors)
+
+
+async def _async_remove_stale_entities(
+    hass: HomeAssistant,
+    config: ConfigEntry,
+    sensors: list[SensorEntity],
+    fetched_installation_ids: set[str],
+) -> None:
+    """Remove registry entries for sensors Målerportal has stopped providing.
+
+    The server decides which counters exist; the entities follow. Two guards
+    keep a hiccup from deleting history: only installations whose counter list
+    was fetched are considered, and an entity is removed only when it is
+    unbacked at two consecutive setups. The first miss is remembered in
+    storage; if the counter is back next time, the entity is forgiven.
+    This is what retires a counter type the server stops sending, and what
+    replaces a "basic" fallback sensor once the real sensors are back.
+    """
+    registry = er.async_get(hass)
+    current_unique_ids = {sensor.unique_id for sensor in sensors}
+    store: Store[list[str]] = Store(hass, STALE_ENTITIES_STORAGE_VERSION, stale_entities_storage_key(config))
+    previously_missing = set(await store.async_load() or [])
+
+    still_missing: set[str] = set()
+    for entry in er.async_entries_for_config_entry(registry, config.entry_id):
+        unique_id = str(entry.unique_id)
+        # Installation ids are UUIDs, so the first underscore ends the id.
+        installation_id = unique_id.split("_", 1)[0]
+        if installation_id not in fetched_installation_ids or unique_id in current_unique_ids:
+            continue
+        if unique_id in previously_missing:
+            _LOGGER.info("Removing entity %s, no longer provided by Målerportal", entry.entity_id)
+            registry.async_remove(entry.entity_id)
+        else:
+            _LOGGER.info(
+                "Entity %s is not provided by Målerportal right now; it will be removed "
+                "if it is still missing at the next setup",
+                entry.entity_id,
+            )
+            still_missing.add(unique_id)
+
+    if still_missing != previously_missing:
+        await store.async_save(sorted(still_missing))
 
 
 def create_sensors_from_counters(
@@ -189,10 +247,6 @@ def create_sensors_from_counters(
             sensors.append(MaalerportalFlowSensor(
                 installation, api_key, smarthome_base_url, counter, polling_interval
             ))
-        elif counter_type == "AcousticNoise":
-            sensors.append(MaalerportalNoiseSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
         # Heat meter specific sensors
         elif counter_type in supply_temp_types:
             sensors.append(MaalerportalSupplyTempSensor(
@@ -234,7 +288,15 @@ def create_sensors_from_counters(
                 sensors.append(MaalerportalStatisticSensor(
                     installation, api_key, smarthome_base_url, counter, polling_interval
                 ))
-    
+
+    # Diagnostics: when we last reached Målerportal, and when the meter last reported.
+    sensors.append(MaalerportalLastApiContactSensor(
+        installation, api_key, smarthome_base_url, primary_counter, polling_interval
+    ))
+    sensors.append(MaalerportalLastMeterReadingSensor(
+        installation, api_key, smarthome_base_url, primary_counter, polling_interval
+    ))
+
     return sensors
 
 
@@ -268,6 +330,7 @@ class MaalerportalBaseSensor(SensorEntity):
         self._installation_type = installation["installationType"]
         self._counter = counter
         self._polling_interval = polling_interval
+        self._last_fetch_started: Optional[datetime] = None
         
         # Rate limiting
         self._rate_limit_delay = 2000  # 2 seconds between requests
@@ -290,6 +353,11 @@ class MaalerportalBaseSensor(SensorEntity):
         if installation.get("nickname"):
             self._base_device_name += f" ({installation['nickname']})"
 
+    @property
+    def installation_id(self) -> str:
+        """The Målerportal installation this sensor belongs to."""
+        return self._installation_id
+
     def _get_translated_meter_type(self) -> str:
         """Get translated meter type for device model."""
         return self.METER_TYPE_TRANSLATIONS.get(self._installation_type, self._installation_type)
@@ -303,6 +371,7 @@ class MaalerportalBaseSensor(SensorEntity):
             manufacturer=self._installation.get("utilityName", "Unknown"),
             model=self._get_translated_meter_type(),
             serial_number=self._installation.get("meterSerial"),
+            configuration_url=consumer_app_url(self._installation_type),
         )
 
     @property
@@ -320,7 +389,31 @@ class MaalerportalBaseSensor(SensorEntity):
             attrs["meter_counter_id"] = self._counter.get("meterCounterId", "")
         return attrs
 
+    @property
+    def _fetch_interval(self) -> timedelta:
+        """How long to wait between fetches; the entry's polling interval."""
+        return self._polling_interval
+
     async def async_update(self) -> None:
+        """Fetch from the API when the configured polling interval has passed.
+
+        Home Assistant polls sensors every 30 seconds; the interval the user set
+        in the options decides how often that poll actually reaches Målerportal.
+        """
+        now = dt_util.utcnow()
+        last = self._last_fetch_started
+        if last is not None and now - last < self._fetch_interval:
+            return
+        self._last_fetch_started = now
+        await self._async_fetch()
+
+    async def async_refresh(self) -> None:
+        """Fetch now, regardless of the polling interval, and publish the state."""
+        self._last_fetch_started = dt_util.utcnow()
+        await self._async_fetch()
+        self.async_write_ha_state()
+
+    async def _async_fetch(self) -> None:
         """Fetch data from API."""
         # If installation is unavailable, only do periodic availability checks
         if not self._installation_available:
@@ -330,18 +423,21 @@ class MaalerportalBaseSensor(SensorEntity):
         try:
             _LOGGER.debug("Fetching meter readings for installation: %s", self._installation_id)
             
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
                 # Get latest readings from new API
                 response = await session.get(
                     f"{self._smarthome_base_url}/installations/{self._installation_id}/readings/latest",
                     headers={"ApiKey": self._api_key},
                 )
 
+                if response.status == 401:
+                    raise ConfigEntryAuthFailed("API key invalid or expired")
+
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded, will retry later")
                     self._rate_limit_delay = min(self._rate_limit_delay * 2, 10000)
                     return
-                
+
                 # Handle 404/403 - installation no longer accessible
                 if response.status in (404, 403):
                     _LOGGER.warning(
@@ -351,7 +447,7 @@ class MaalerportalBaseSensor(SensorEntity):
                     )
                     await self._handle_installation_unavailable()
                     return
-                    
+
                 if not response.ok:
                     _LOGGER.error("API request failed: HTTP %s", response.status)
                     return
@@ -360,7 +456,7 @@ class MaalerportalBaseSensor(SensorEntity):
                 self._rate_limit_delay = 2000
                 
                 # Update last contact time
-                self._last_contact = datetime.now()
+                self._last_contact = dt_util.utcnow()
 
                 readings_data = await response.json()
                 _LOGGER.debug("Readings data: %s", readings_data)
@@ -370,6 +466,9 @@ class MaalerportalBaseSensor(SensorEntity):
                 else:
                     _LOGGER.debug("No meter counters found in API response")
 
+        except ConfigEntryAuthFailed:
+            self._async_start_reauth()
+            raise
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout fetching meter readings for installation: %s", self._installation_id)
         except aiohttp.ClientError as err:
@@ -460,16 +559,19 @@ class MaalerportalBaseSensor(SensorEntity):
                 self._get_current_check_interval()
             )
             
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
                 response = await session.get(
                     f"{self._smarthome_base_url}/addresses",
                     headers={"ApiKey": self._api_key},
                 )
                 
+                if response.status == 401:
+                    raise ConfigEntryAuthFailed("API key invalid or expired")
+
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded during availability check")
                     return False
-                
+
                 if not response.ok:
                     _LOGGER.debug("Availability check failed: HTTP %s", response.status)
                     return False
@@ -505,6 +607,9 @@ class MaalerportalBaseSensor(SensorEntity):
                     )
                     return False
                     
+        except ConfigEntryAuthFailed:
+            self._async_start_reauth()
+            raise
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout during availability check for installation %s", self._installation_id)
         except aiohttp.ClientError as err:
@@ -547,6 +652,31 @@ class MaalerportalBaseSensor(SensorEntity):
             _LOGGER.error("Error parsing meter value '%s': %s", latest_value, err)
             return None
 
+    @callback
+    def _async_start_reauth(self) -> None:
+        """Ask for a new key when the gateway rejects ours while running.
+
+        Home Assistant only starts reauth by itself for ConfigEntryAuthFailed
+        raised during setup; from an entity update the exception is just
+        logged, so the entity has to start the flow. Starting it twice is
+        harmless, HA reuses the flow in progress.
+        """
+        entry = self.platform.config_entry if self.platform else None
+        if entry is not None:
+            entry.async_start_reauth(self.hass)
+
+    def _apply_counter_unit(
+        self, default_unit: str | None, device_class: SensorDeviceClass | None
+    ) -> None:
+        """Set unit and device class from the counter's reported unit (see units.py).
+
+        The API unit wins when Home Assistant can handle it for the device class;
+        default_unit is only used when the counter reports no unit.
+        """
+        self._attr_native_unit_of_measurement, self._attr_device_class = resolve_unit(
+            self._counter, default_unit, device_class, installation_id=self._installation_id
+        )
+
 
 class MaalerportalMainSensor(MaalerportalBaseSensor):
     """Main sensor for primary meter counter."""
@@ -564,33 +694,27 @@ class MaalerportalMainSensor(MaalerportalBaseSensor):
         
         self._attr_unique_id = f"{self._installation_id}_main"
         
-        # Set attributes based on counter type
+        # Translation key and the unit/device class expected for the counter type.
+        # The unit the API reports wins when Home Assistant can handle it; the
+        # expected unit is only the fallback for counters that report none.
         counter_type = counter.get("counterType", "").lower()
         if counter_type in ["coldwater", "hotwater"]:
             self._attr_translation_key = "meter_reading_water"
-            self._attr_device_class = SensorDeviceClass.WATER
-            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+            default_unit, device_class = UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER
             self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         elif counter_type in ["electricityfromgrid", "electricitytogrid"]:
             self._attr_translation_key = "meter_reading_electricity"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
             self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         elif counter_type == "heat":
             self._attr_translation_key = "meter_reading_heat"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
             self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         else:
             self._attr_translation_key = "meter_reading"
-            self._attr_device_class = None
-            self._attr_native_unit_of_measurement = counter.get("unit")
+            default_unit, device_class = None, None
             self._attr_state_class = SensorStateClass.MEASUREMENT
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
+        self._apply_counter_unit(default_unit, device_class)
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update main sensor from primary counter."""
@@ -659,11 +783,6 @@ class MaalerportalBasicSensor(MaalerportalBaseSensor):
             self._attr_native_unit_of_measurement = None
             self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update basic sensor from first available counter."""
         if meter_counters:
@@ -688,6 +807,65 @@ class MaalerportalBasicSensor(MaalerportalBaseSensor):
 
 # Specialized sensor classes for different counter types
 
+class MaalerportalLastApiContactSensor(MaalerportalBaseSensor):
+    """When the integration last got a successful answer from Målerportal."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:cloud-check-outline"
+
+    def __init__(
+        self,
+        installation: dict,
+        api_key: str,
+        smarthome_base_url: str,
+        counter: dict | None,
+        polling_interval: timedelta = timedelta(minutes=30)
+    ) -> None:
+        """Initialize the last API contact sensor."""
+        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
+        self._attr_translation_key = "last_api_contact"
+        self._attr_unique_id = f"{self._installation_id}_last_api_contact"
+
+    @property
+    def native_value(self) -> Optional[datetime]:
+        """Return the time of the last successful API response."""
+        return self._last_contact
+
+
+class MaalerportalLastMeterReadingSensor(MaalerportalBaseSensor):
+    """When the meter itself last reported a value, across all its counters."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:counter"
+
+    def __init__(
+        self,
+        installation: dict,
+        api_key: str,
+        smarthome_base_url: str,
+        counter: dict | None,
+        polling_interval: timedelta = timedelta(minutes=30)
+    ) -> None:
+        """Initialize the last meter reading sensor."""
+        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
+        self._attr_translation_key = "last_meter_reading"
+        self._attr_unique_id = f"{self._installation_id}_last_meter_reading"
+
+    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+        """Take the newest reading timestamp reported by any counter on the meter."""
+        timestamps = [
+            parsed
+            for counter in meter_counters
+            if (raw := counter.get("latestTimestamp"))
+            and (parsed := dt_util.parse_datetime(raw)) is not None
+        ]
+        if timestamps:
+            self._attr_native_value = dt_util.as_utc(max(timestamps))
+            _LOGGER.debug("Updated last meter reading: %s", self._attr_native_value)
+
+
 class MaalerportalBatterySensor(MaalerportalBaseSensor):
     """Battery days remaining sensor."""
 
@@ -708,11 +886,6 @@ class MaalerportalBatterySensor(MaalerportalBaseSensor):
         self._attr_native_unit_of_measurement = UnitOfTime.DAYS
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:battery"
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update battery sensor."""
@@ -751,11 +924,6 @@ class MaalerportalTemperatureSensor(MaalerportalBaseSensor):
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update temperature sensor."""
         for counter in meter_counters:
@@ -793,11 +961,6 @@ class MaalerportalWaterTemperatureSensor(MaalerportalBaseSensor):
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update water temperature sensor."""
         for counter in meter_counters:
@@ -831,14 +994,12 @@ class MaalerportalFlowSensor(MaalerportalBaseSensor):
             self._attr_translation_key = "min_flow"
             self._attr_unique_id = f"{self._installation_id}_flow_min"
             
-        self._attr_native_unit_of_measurement = "L/h"
+        # Flow is L/h unless the utility reports otherwise. With the volume-flow-rate
+        # device class Home Assistant converts between m³/h, L/min etc. itself and
+        # lets the user pick a display unit on the entity.
+        self._apply_counter_unit(LITERS_PER_HOUR, SensorDeviceClass.VOLUME_FLOW_RATE)
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:water-pump"
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update flow sensor."""
@@ -847,43 +1008,7 @@ class MaalerportalFlowSensor(MaalerportalBaseSensor):
                 value = self._parse_counter_value(counter)
                 if value is not None:
                     self._attr_native_value = round(value, 3)
-                    _LOGGER.debug("Updated flow: %s L/h", value)
-                break
-
-
-class MaalerportalNoiseSensor(MaalerportalBaseSensor):
-    """Acoustic noise sensor."""
-
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
-        """Initialize the noise sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
-        self._attr_translation_key = "acoustic_noise"
-        self._attr_unique_id = f"{self._installation_id}_acoustic_noise"
-        self._attr_native_unit_of_measurement = UnitOfFrequency.HERTZ
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:volume-high"
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update noise sensor."""
-        for counter in meter_counters:
-            if counter.get("counterType") == "AcousticNoise":
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = int(value)
-                    _LOGGER.debug("Updated acoustic noise: %s Hz", value)
+                    _LOGGER.debug("Updated flow: %s %s", value, self._attr_native_unit_of_measurement)
                 break
 
 
@@ -903,39 +1028,30 @@ class MaalerportalSecondarySensor(MaalerportalBaseSensor):
         
         counter_type = counter.get("counterType", "")
         
-        # Set translation key based on counter type
+        # Translation key and the unit/device class expected for the counter type.
+        # The unit the API reports wins when Home Assistant can handle it.
         if counter_type == "ColdWater":
             self._attr_translation_key = "cold_water"
-            self._attr_device_class = SensorDeviceClass.WATER
-            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+            default_unit, device_class = UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER
         elif counter_type == "HotWater":
             self._attr_translation_key = "hot_water"
-            self._attr_device_class = SensorDeviceClass.WATER
-            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+            default_unit, device_class = UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER
         elif counter_type == "ElectricityFromGrid":
             self._attr_translation_key = "electricity_import"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         elif counter_type == "ElectricityToGrid":
             self._attr_translation_key = "electricity_export"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         elif counter_type == "Heat":
             self._attr_translation_key = "heat"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         else:
             self._attr_translation_key = "meter_reading"
-            self._attr_device_class = None
-            self._attr_native_unit_of_measurement = counter.get("unit")
+            default_unit, device_class = None, None
+        self._apply_counter_unit(default_unit, device_class)
         
         self._attr_unique_id = f"{self._installation_id}_{counter_type.lower()}_secondary"
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update secondary sensor."""
@@ -985,11 +1101,6 @@ class MaalerportalPriceSensor(MaalerportalBaseSensor):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:currency-usd"
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update price sensor."""
         for counter in meter_counters:
@@ -1032,31 +1143,28 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
         # (counter_type may always be "ColdWater" for water meters)
         installation_type = installation.get("installationType", "").lower()
         
-        # Set translation key based on counter type - these show virtual meter reading
+        # Set translation key based on counter type - these show virtual meter reading.
+        # The unit the API reports wins when Home Assistant can handle it.
         if counter_type == "ColdWater" or counter_type == "HotWater":
             # Use installation type to determine if it's hot or cold water
             if installation_type == "hotwater":
                 self._attr_translation_key = "virtual_hot_water_meter"
             else:
                 self._attr_translation_key = "virtual_cold_water_meter"
-            self._attr_device_class = SensorDeviceClass.WATER
-            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+            default_unit, device_class = UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER
         elif counter_type == "ElectricityFromGrid":
             self._attr_translation_key = "virtual_electricity_meter"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         elif counter_type == "ElectricityToGrid":
             self._attr_translation_key = "virtual_electricity_export_meter"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         elif counter_type == "Heat":
             self._attr_translation_key = "virtual_heat_meter"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         else:
             self._attr_translation_key = "virtual_meter"
-            self._attr_device_class = None
-            self._attr_native_unit_of_measurement = counter.get("unit")
+            default_unit, device_class = None, None
+        self._apply_counter_unit(default_unit, device_class)
         
         # Create unique ID based on counter type and primary/secondary status
         suffix = "primary" if is_primary else "secondary"
@@ -1121,8 +1229,12 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
         # Fetch initial data
         await self._fetch_and_accumulate()
 
-    @Throttle(timedelta(hours=1))
-    async def async_update(self) -> None:
+    @property
+    def _fetch_interval(self) -> timedelta:
+        """Consumption arrives per hour, so never fetch it more often than that."""
+        return max(self._polling_interval, timedelta(hours=1))
+
+    async def _async_fetch(self) -> None:
         """Fetch new consumption data and update cumulative sum."""
         # If installation is unavailable, only do periodic availability checks
         if not self._installation_available:
@@ -1143,12 +1255,17 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
             now = datetime.now(timezone.utc)
             self._last_contact = now
             
-            # Calculate date range - fetch data since last processed, or last 30 days if first time
-            if self._last_processed_timestamp:
+            # Calculate date range. API allows max 31 days per request, so cap the
+            # window at 30 days even if our last seen reading is older (e.g. meter
+            # has been silent for months) — otherwise every poll fires an invalid
+            # 6-month request that the API rejects. The reading-timestamp filter
+            # below still admits any genuinely new readings inside the window.
+            window_start = now - timedelta(days=30)
+            if self._last_processed_timestamp and self._last_processed_timestamp > window_start:
                 start_date = self._last_processed_timestamp
             else:
-                start_date = now - timedelta(days=30)
-            
+                start_date = window_start
+
             end_date = now
             
             # Format as ISO datetime strings for the API
@@ -1158,7 +1275,7 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
             _LOGGER.debug("Fetching consumption for counter %s from %s to %s", 
                           counter_id, start_date_iso, end_date_iso)
             
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
                 # Use POST endpoint with JSON body
                 response = await session.post(
                     f"{self._smarthome_base_url}/installations/{self._installation_id}/readings/historical",
@@ -1166,10 +1283,13 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
                     headers={"ApiKey": self._api_key, "Content-Type": "application/json"},
                 )
                 
+                if response.status == 401:
+                    raise ConfigEntryAuthFailed("API key invalid or expired")
+
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded for historical data, will retry later")
                     return
-                
+
                 # Handle 404/403 - installation no longer accessible
                 if response.status in (404, 403):
                     _LOGGER.warning(
@@ -1179,7 +1299,7 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
                     )
                     await self._handle_installation_unavailable()
                     return
-                
+
                 if not response.ok:
                     _LOGGER.error("Historical data request failed: HTTP %s", response.status)
                     return
@@ -1256,6 +1376,9 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
                 else:
                     _LOGGER.debug("No valid readings found for consumption calculation")
                     
+        except ConfigEntryAuthFailed:
+            self._async_start_reauth()
+            raise
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout fetching historical data for consumption sensor")
         except aiohttp.ClientError as err:
@@ -1291,11 +1414,6 @@ class MaalerportalSupplyTempSensor(MaalerportalBaseSensor):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:thermometer-chevron-up"
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update supply temperature sensor."""
         for counter in meter_counters:
@@ -1327,11 +1445,6 @@ class MaalerportalReturnTempSensor(MaalerportalBaseSensor):
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:thermometer-chevron-down"
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update return temperature sensor."""
@@ -1365,11 +1478,6 @@ class MaalerportalTempDiffSensor(MaalerportalBaseSensor):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:thermometer-lines"
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
-
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update temperature difference sensor."""
         for counter in meter_counters:
@@ -1397,15 +1505,9 @@ class MaalerportalHeatPowerSensor(MaalerportalBaseSensor):
         
         self._attr_translation_key = "heat_power"
         self._attr_unique_id = f"{self._installation_id}_heat_power"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
+        self._apply_counter_unit(UnitOfPower.KILO_WATT, SensorDeviceClass.POWER)
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:fire"
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update heat power sensor."""
@@ -1414,7 +1516,7 @@ class MaalerportalHeatPowerSensor(MaalerportalBaseSensor):
                 value = self._parse_counter_value(counter)
                 if value is not None:
                     self._attr_native_value = round(value, 2)
-                    _LOGGER.debug("Updated heat power: %s kW", value)
+                    _LOGGER.debug("Updated heat power: %s %s", value, self._attr_native_unit_of_measurement)
                 break
 
 
@@ -1434,15 +1536,9 @@ class MaalerportalHeatVolumeSensor(MaalerportalBaseSensor):
         
         self._attr_translation_key = "heat_volume"
         self._attr_unique_id = f"{self._installation_id}_heat_volume"
-        self._attr_device_class = SensorDeviceClass.WATER
-        self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+        self._apply_counter_unit(UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER)
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_icon = "mdi:water-thermometer"
-
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
-        """Fetch data from API with throttling."""
-        await super().async_update()
 
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update heat volume sensor."""
@@ -1451,7 +1547,7 @@ class MaalerportalHeatVolumeSensor(MaalerportalBaseSensor):
                 value = self._parse_counter_value(counter)
                 if value is not None:
                     self._attr_native_value = round(value, 3)
-                    _LOGGER.debug("Updated heat volume: %s m³", value)
+                    _LOGGER.debug("Updated heat volume: %s %s", value, self._attr_native_unit_of_measurement)
                 break
 
 
@@ -1486,7 +1582,8 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
         # (counter_type may always be "ColdWater" for water meters)
         installation_type = installation.get("installationType", "").lower()
         
-        # Set attributes based on counter type
+        # Set attributes based on counter type. The unit the API reports wins when
+        # Home Assistant can handle it, and the imported statistics follow it.
         if counter_type == "ColdWater" or counter_type == "HotWater":
             # Use installation type to determine if it's hot or cold water
             if installation_type == "hotwater":
@@ -1495,33 +1592,25 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
             else:
                 self._attr_translation_key = "cold_water_statistic"
                 self._attr_icon = "mdi:water"
-            self._attr_device_class = SensorDeviceClass.WATER
-            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
-            self._unit_class = "volume"
+            default_unit, device_class = UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER
         elif counter_type == "ElectricityFromGrid":
             self._attr_translation_key = "electricity_statistic" if is_primary else "electricity_import_statistic"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
             self._attr_icon = "mdi:transmission-tower-import"
-            self._unit_class = "energy"
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         elif counter_type == "ElectricityToGrid":
             self._attr_translation_key = "electricity_export_statistic"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
             self._attr_icon = "mdi:transmission-tower-export"
-            self._unit_class = "energy"
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         elif counter_type == "Heat":
             self._attr_translation_key = "heat_statistic"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
             self._attr_icon = "mdi:fire"
-            self._unit_class = "energy"
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         else:
             self._attr_translation_key = "energy_statistic"
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
             self._attr_icon = "mdi:chart-line-variant"
-            self._unit_class = "energy"
+            default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
+        self._apply_counter_unit(default_unit, device_class)
+        self._unit_class = statistics_unit_class(self._attr_device_class)
         
         self._attr_unique_id = f"{self._installation_id}_{counter_type.lower()}_statistic_{suffix}"
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
@@ -1605,8 +1694,7 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
         # Schedule initial statistics update
         self.hass.async_create_task(self._async_update_statistics())
 
-    @Throttle(timedelta(minutes=30))
-    async def async_update(self) -> None:
+    async def _async_fetch(self) -> None:
         """Update statistics from historical API data."""
         # If installation is unavailable, only do periodic availability checks
         if not self._installation_available:
@@ -1659,17 +1747,20 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
             start_date_iso = start_date.strftime("%Y-%m-%dT00:00:00Z")
             end_date_iso = end_date.strftime("%Y-%m-%dT23:59:59Z")
             
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
                 response = await session.post(
                     f"{self._smarthome_base_url}/installations/{self._installation_id}/readings/historical",
                     json={"from": start_date_iso, "to": end_date_iso},
                     headers={"ApiKey": self._api_key, "Content-Type": "application/json"},
                 )
                 
+                if response.status == 401:
+                    raise ConfigEntryAuthFailed("API key invalid or expired")
+
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded for statistics data, will retry later")
                     return
-                
+
                 # Handle 404/403 - installation no longer accessible
                 if response.status in (404, 403):
                     _LOGGER.warning(
@@ -1679,7 +1770,7 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
                     )
                     await self._handle_installation_unavailable()
                     return
-                
+
                 if not response.ok:
                     _LOGGER.error("Statistics data request failed: HTTP %s", response.status)
                     return
@@ -1861,7 +1952,6 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
                 
                 # Create metadata - use "recorder" as source for sensor statistics
                 metadata = StatisticMetaData(
-                    has_mean=False,
                     has_sum=True,
                     mean_type=StatisticMeanType.NONE,
                     name=self.name or f"{self._base_device_name}",
@@ -1892,6 +1982,9 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
                 if self._reading_type == "consumption":
                     self.async_write_ha_state()
                 
+        except ConfigEntryAuthFailed:
+            self._async_start_reauth()
+            raise
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout fetching statistics data for sensor")
         except aiohttp.ClientError as err:

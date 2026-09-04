@@ -4,14 +4,19 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import aiohttp
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers import entity_registry as er
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import entity_platform
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN
+from .api import CannotConnect, InvalidApiKey, validate_api_key
+from .const import DOMAIN, STALE_ENTITIES_STORAGE_VERSION, stale_entities_storage_key
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +39,15 @@ SERVICE_REFRESH_SCHEMA = vol.Schema({
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Målerportal from a config entry."""
 
+    # Check the key before any platform runs: Home Assistant only starts the
+    # reauth flow for ConfigEntryAuthFailed raised here, not from a platform.
+    try:
+        await validate_api_key(async_get_clientsession(hass), entry.data["api_key"])
+    except InvalidApiKey as err:
+        raise ConfigEntryAuthFailed("API key invalid or expired") from err
+    except (CannotConnect, aiohttp.ClientError, TimeoutError) as err:
+        raise ConfigEntryNotReady(f"Målerportal API not reachable: {err}") from err
+
     hass.data.setdefault(DOMAIN, {})
     
     # Store the configuration data for sensors to use
@@ -41,7 +55,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "api_key": entry.data["api_key"],
         "smarthome_base_url": entry.data["smarthome_base_url"],
         "installations": entry.data["installations"],
-        "sensors": [],  # Will be populated by sensor platform
     }
     
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -52,31 +65,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register refresh service (only once)
     if not hass.services.has_service(DOMAIN, SERVICE_REFRESH):
         async def async_refresh_service(call: ServiceCall) -> None:
-            """Handle refresh service call."""
+            """Fetch fresh readings now, ignoring the polling interval."""
             installation_id = call.data.get(ATTR_INSTALLATION_ID)
-            
             _LOGGER.debug("Refresh service called with installation_id: %s", installation_id)
-            
-            # Find all sensors and refresh them
-            entity_registry = er.async_get(hass)
-            entities = er.async_entries_for_config_entry(entity_registry, entry.entry_id)
-            
-            for entity_entry in entities:
-                # Get the entity state to check if it belongs to the right installation
-                if installation_id:
-                    # Filter by installation_id if provided
-                    if installation_id not in entity_entry.unique_id:
-                        continue
-                
-                # Schedule an update for this entity
-                hass.async_create_task(
-                    hass.services.async_call(
-                        "homeassistant",
-                        "update_entity",
-                        {"entity_id": entity_entry.entity_id},
-                    )
-                )
-                _LOGGER.debug("Scheduled refresh for entity: %s", entity_entry.entity_id)
+
+            # Every loaded entry's sensors, not just the entry that registered the service.
+            sensors = [
+                entity
+                for platform in entity_platform.async_get_platforms(hass, DOMAIN)
+                for entity in platform.entities.values()
+                if installation_id is None or entity.installation_id == installation_id
+            ]
+            for sensor in sensors:
+                await sensor.async_refresh()
+            _LOGGER.debug("Refreshed %d entities", len(sensors))
 
         hass.services.async_register(
             DOMAIN,
@@ -87,6 +89,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("Registered %s.%s service", DOMAIN, SERVICE_REFRESH)
 
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop the stale-entity bookkeeping the sensor platform keeps for this entry."""
+    await Store(hass, STALE_ENTITIES_STORAGE_VERSION, stale_entities_storage_key(entry)).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

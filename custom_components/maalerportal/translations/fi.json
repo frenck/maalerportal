@@ -67,9 +67,6 @@
       "min_flow": {
         "name": "Min. virtaus"
       },
-      "acoustic_noise": {
-        "name": "Akustinen melu"
-      },
       "price_per_unit": {
         "name": "Hinta per yksikkö"
       },
@@ -126,60 +123,48 @@
       },
       "virtual_meter": {
         "name": "Virtuaalinen mittari"
+      },
+      "last_api_contact": {
+        "name": "Viimeisin yhteys Målerportaliin"
+      },
+      "last_meter_reading": {
+        "name": "Viimeisin lukema mittarilta"
       }
     }
   },
   "config": {
     "abort": {
-      "already_configured": "Laite on jo määritetty"
+      "already_configured": "Laite on jo määritetty",
+      "reauth_successful": "Tunnistautuminen päivitetty",
+      "reconfigure_successful": "API-avain päivitetty"
     },
     "error": {
       "cannot_connect": "Yhteyden muodostaminen epäonnistui",
-      "invalid_auth": "Väärä sähköposti ja/tai salasana",
-      "invalid_code": "Virheellinen vahvistuskoodi. Yritä uudelleen.",
-      "invalid_code_format": "Koodin on oltava 6 numeroa",
-      "no_2fa_methods": "Kaksivaiheinen tunnistautuminen vaaditaan, mutta menetelmiä ei ole saatavilla",
+      "invalid_api_key": "Virheellinen API-avain",
       "rate_limit": "Pyyntöraja ylitetty. Yritä myöhemmin uudelleen.",
       "unknown": "Odottamaton virhe",
-      "user_not_found": "Tätä sähköpostia vastaavaa tiliä ei löytynyt",
-      "passkey_only": "Tämä tili käyttää passkey-kirjautumista, jota Home Assistant ei tue",
       "no_meters": "Tililtäsi ei löytynyt mittareita. Lisää ensin mittarit Målerportal-kuluttajasovelluksen kautta."
     },
     "step": {
       "user": {
-        "title": "Kirjaudu Målerportaliin",
-        "description": "Syötä sähköpostiosoitteesi jatkaaksesi",
+        "title": "Yhdistä Målerportaliin",
+        "description": "Liitä API-avain Målerportal-kuluttajasovelluksesta. Voit luoda avaimen kohdasta Valikko → Smart Home → Luo API-avain.",
         "data": {
-          "email": "Sähköposti"
+          "api_key": "API-avain"
         }
       },
-      "password": {
-        "title": "Syötä salasana",
-        "description": "Kirjaudutaan käyttäjänä {email}",
+      "reauth_confirm": {
+        "title": "Päivitä Målerportal API-avain",
+        "description": "API-avaimesi ei ole enää voimassa. Liitä uusi avain Målerportal-kuluttajasovelluksesta kohdasta Valikko → Smart Home → Luo API-avain.",
         "data": {
-          "password": "Salasana"
+          "api_key": "API-avain"
         }
       },
-      "2fa_choice": {
-        "title": "Kaksivaiheinen tunnistautuminen",
-        "description": "Valitse miten haluat vahvistaa henkilöllisyytesi",
-        "menu_options": {
-          "totp": "Authenticator-sovellus",
-          "email": "Sähköpostikoodi"
-        }
-      },
-      "2fa_totp": {
-        "title": "Authenticator-sovellus",
-        "description": "Syötä 6-numeroinen koodi authenticator-sovelluksestasi",
+      "reconfigure": {
+        "title": "Vaihda Målerportal API-avain",
+        "description": "Liitä uusi API-avain Målerportal-kuluttajasovelluksesta kohdasta Valikko → Smart Home → Luo API-avain.",
         "data": {
-          "code": "Vahvistuskoodi"
-        }
-      },
-      "2fa_email": {
-        "title": "Sähköpostivahvistus",
-        "description": "6-numeroinen koodi on lähetetty osoitteeseen {email}. Syötä se alle.",
-        "data": {
-          "code": "Vahvistuskoodi"
+          "api_key": "API-avain"
         }
       },
       "entity_selection": {

@@ -67,9 +67,6 @@
       "min_flow": {
         "name": "Min. flow"
       },
-      "acoustic_noise": {
-        "name": "Akustisk støj"
-      },
       "price_per_unit": {
         "name": "Pris pr. enhed"
       },
@@ -126,60 +123,48 @@
       },
       "virtual_meter": {
         "name": "Virtuel tællerstand"
+      },
+      "last_api_contact": {
+        "name": "Sidste kontakt med Målerportal"
+      },
+      "last_meter_reading": {
+        "name": "Seneste aflæsning fra måler"
       }
     }
   },
   "config": {
     "abort": {
-      "already_configured": "Enheden er allerede konfigureret"
+      "already_configured": "Enheden er allerede konfigureret",
+      "reauth_successful": "Adgang opdateret",
+      "reconfigure_successful": "API-nøgle opdateret"
     },
     "error": {
       "cannot_connect": "Kunne ikke oprette forbindelse",
-      "invalid_auth": "Forkert e-mail og/eller adgangskode",
-      "invalid_code": "Ugyldig bekræftelseskode. Prøv igen.",
-      "invalid_code_format": "Koden skal være 6 cifre",
-      "no_2fa_methods": "To-faktor-godkendelse kræves, men ingen metoder er tilgængelige",
+      "invalid_api_key": "Ugyldig API-nøgle",
       "rate_limit": "For mange forsøg. Prøv igen senere.",
       "unknown": "Uventet fejl",
-      "user_not_found": "Ingen konto fundet med denne e-mail",
-      "passkey_only": "Denne konto bruger passkey-login, som ikke understøttes i Home Assistant",
       "no_meters": "Der blev ikke fundet nogen målere på din konto. Tilføj venligst målere via Målerportal forbrugerappen først."
     },
     "step": {
       "user": {
-        "title": "Log ind på Målerportal",
-        "description": "Indtast din e-mailadresse for at fortsætte",
+        "title": "Forbind til Målerportal",
+        "description": "Indsæt en API-nøgle fra Målerportal-forbrugerappen. Du kan oprette en under Menu → Smart Home → Opret API-nøgle.",
         "data": {
-          "email": "E-mail"
+          "api_key": "API-nøgle"
         }
       },
-      "password": {
-        "title": "Indtast adgangskode",
-        "description": "Logger ind som {email}",
+      "reauth_confirm": {
+        "title": "Opdater Målerportal API-nøgle",
+        "description": "Din API-nøgle er ikke længere gyldig. Indsæt en ny nøgle fra Målerportal-forbrugerappen under Menu → Smart Home → Opret API-nøgle.",
         "data": {
-          "password": "Adgangskode"
+          "api_key": "API-nøgle"
         }
       },
-      "2fa_choice": {
-        "title": "To-faktor-godkendelse",
-        "description": "Vælg hvordan du vil bekræfte din identitet",
-        "menu_options": {
-          "totp": "Autentificeringsapp",
-          "email": "E-mail-kode"
-        }
-      },
-      "2fa_totp": {
-        "title": "Autentificeringsapp",
-        "description": "Indtast den 6-cifrede kode fra din autentificeringsapp",
+      "reconfigure": {
+        "title": "Udskift Målerportal API-nøgle",
+        "description": "Indsæt en ny API-nøgle fra Målerportal-forbrugerappen under Menu → Smart Home → Opret API-nøgle.",
         "data": {
-          "code": "Bekræftelseskode"
-        }
-      },
-      "2fa_email": {
-        "title": "E-mail-bekræftelse",
-        "description": "En 6-cifret kode er blevet sendt til {email}. Indtast den nedenfor.",
-        "data": {
-          "code": "Bekræftelseskode"
+          "api_key": "API-nøgle"
         }
       },
       "entity_selection": {

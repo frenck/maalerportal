@@ -67,9 +67,6 @@
       "min_flow": {
         "name": "Min flöde"
       },
-      "acoustic_noise": {
-        "name": "Akustiskt brus"
-      },
       "price_per_unit": {
         "name": "Pris per enhet"
       },
@@ -126,60 +123,48 @@
       },
       "virtual_meter": {
         "name": "Virtuell mätare"
+      },
+      "last_api_contact": {
+        "name": "Senaste kontakt med Målerportal"
+      },
+      "last_meter_reading": {
+        "name": "Senaste avläsning från mätaren"
       }
     }
   },
   "config": {
     "abort": {
-      "already_configured": "Enheten är redan konfigurerad"
+      "already_configured": "Enheten är redan konfigurerad",
+      "reauth_successful": "Autentisering uppdaterad",
+      "reconfigure_successful": "API-nyckel uppdaterad"
     },
     "error": {
       "cannot_connect": "Kunde inte ansluta",
-      "invalid_auth": "Fel e-post och/eller lösenord",
-      "invalid_code": "Ogiltig verifieringskod. Försök igen.",
-      "invalid_code_format": "Koden måste vara 6 siffror",
-      "no_2fa_methods": "Tvåfaktorsautentisering krävs men inga metoder är tillgängliga",
+      "invalid_api_key": "Ogiltig API-nyckel",
       "rate_limit": "Begäran överskred gränsen. Försök igen senare.",
       "unknown": "Oväntat fel",
-      "user_not_found": "Inget konto hittades med denna e-post",
-      "passkey_only": "Detta konto använder passkey-inloggning som inte stöds i Home Assistant",
       "no_meters": "Inga mätare hittades på ditt konto. Vänligen lägg till mätare via Målerportal konsumentappen först."
     },
     "step": {
       "user": {
-        "title": "Logga in på Målerportal",
-        "description": "Ange din e-postadress för att fortsätta",
+        "title": "Anslut till Målerportal",
+        "description": "Klistra in en API-nyckel från Målerportal-konsumentappen. Du kan skapa en under Meny → Smart Home → Skapa API-nyckel.",
         "data": {
-          "email": "E-post"
+          "api_key": "API-nyckel"
         }
       },
-      "password": {
-        "title": "Ange lösenord",
-        "description": "Loggar in som {email}",
+      "reauth_confirm": {
+        "title": "Uppdatera Målerportal API-nyckel",
+        "description": "Din API-nyckel är inte längre giltig. Klistra in en ny nyckel från Målerportal-konsumentappen under Meny → Smart Home → Skapa API-nyckel.",
         "data": {
-          "password": "Lösenord"
+          "api_key": "API-nyckel"
         }
       },
-      "2fa_choice": {
-        "title": "Tvåfaktorsautentisering",
-        "description": "Välj hur du vill verifiera din identitet",
-        "menu_options": {
-          "totp": "Authenticator-app",
-          "email": "E-postkod"
-        }
-      },
-      "2fa_totp": {
-        "title": "Authenticator-app",
-        "description": "Ange den 6-siffriga koden från din authenticator-app",
+      "reconfigure": {
+        "title": "Byt Målerportal API-nyckel",
+        "description": "Klistra in en ny API-nyckel från Målerportal-konsumentappen under Meny → Smart Home → Skapa API-nyckel.",
         "data": {
-          "code": "Verifieringskod"
-        }
-      },
-      "2fa_email": {
-        "title": "E-postverifiering",
-        "description": "En 6-siffrig kod har skickats till {email}. Ange den nedan.",
-        "data": {
-          "code": "Verifieringskod"
+          "api_key": "API-nyckel"
         }
       },
       "entity_selection": {

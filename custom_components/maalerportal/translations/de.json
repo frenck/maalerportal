@@ -67,9 +67,6 @@
       "min_flow": {
         "name": "Min. Durchfluss"
       },
-      "acoustic_noise": {
-        "name": "Akustisches Rauschen"
-      },
       "price_per_unit": {
         "name": "Preis pro Einheit"
       },
@@ -126,60 +123,48 @@
       },
       "virtual_meter": {
         "name": "Virtueller Zähler"
+      },
+      "last_api_contact": {
+        "name": "Letzter Kontakt mit Målerportal"
+      },
+      "last_meter_reading": {
+        "name": "Letzte Ablesung vom Zähler"
       }
     }
   },
   "config": {
     "abort": {
-      "already_configured": "Gerät ist bereits konfiguriert"
+      "already_configured": "Gerät ist bereits konfiguriert",
+      "reauth_successful": "Authentifizierung aktualisiert",
+      "reconfigure_successful": "API-Schlüssel aktualisiert"
     },
     "error": {
       "cannot_connect": "Verbindung fehlgeschlagen",
-      "invalid_auth": "Falsche E-Mail und/oder Passwort",
-      "invalid_code": "Ungültiger Bestätigungscode. Bitte versuchen Sie es erneut.",
-      "invalid_code_format": "Der Code muss 6 Ziffern haben",
-      "no_2fa_methods": "Zwei-Faktor-Authentifizierung erforderlich, aber keine Methoden verfügbar",
+      "invalid_api_key": "Ungültiger API-Schlüssel",
       "rate_limit": "Anfragelimit überschritten. Bitte versuchen Sie es später erneut.",
       "unknown": "Unerwarteter Fehler",
-      "user_not_found": "Kein Konto mit dieser E-Mail gefunden",
-      "passkey_only": "Dieses Konto verwendet Passkey-Anmeldung, die in Home Assistant nicht unterstützt wird",
       "no_meters": "Keine Zähler auf Ihrem Konto gefunden. Bitte fügen Sie zuerst Zähler über die Målerportal-Verbraucher-App hinzu."
     },
     "step": {
       "user": {
-        "title": "Bei Målerportal anmelden",
-        "description": "Geben Sie Ihre E-Mail-Adresse ein, um fortzufahren",
+        "title": "Mit Målerportal verbinden",
+        "description": "Fügen Sie einen API-Schlüssel aus der Målerportal-Verbraucher-App ein. Sie können einen unter Menü → Smart Home → API-Schlüssel erstellen anlegen.",
         "data": {
-          "email": "E-Mail"
+          "api_key": "API-Schlüssel"
         }
       },
-      "password": {
-        "title": "Passwort eingeben",
-        "description": "Anmeldung als {email}",
+      "reauth_confirm": {
+        "title": "Målerportal API-Schlüssel aktualisieren",
+        "description": "Ihr API-Schlüssel ist nicht mehr gültig. Fügen Sie einen neuen Schlüssel aus der Målerportal-Verbraucher-App unter Menü → Smart Home → API-Schlüssel erstellen ein.",
         "data": {
-          "password": "Passwort"
+          "api_key": "API-Schlüssel"
         }
       },
-      "2fa_choice": {
-        "title": "Zwei-Faktor-Authentifizierung",
-        "description": "Wählen Sie, wie Sie Ihre Identität bestätigen möchten",
-        "menu_options": {
-          "totp": "Authenticator-App",
-          "email": "E-Mail-Code"
-        }
-      },
-      "2fa_totp": {
-        "title": "Authenticator-App",
-        "description": "Geben Sie den 6-stelligen Code aus Ihrer Authenticator-App ein",
+      "reconfigure": {
+        "title": "Målerportal API-Schlüssel ersetzen",
+        "description": "Fügen Sie einen neuen API-Schlüssel aus der Målerportal-Verbraucher-App unter Menü → Smart Home → API-Schlüssel erstellen ein.",
         "data": {
-          "code": "Bestätigungscode"
-        }
-      },
-      "2fa_email": {
-        "title": "E-Mail-Verifizierung",
-        "description": "Ein 6-stelliger Code wurde an {email} gesendet. Geben Sie ihn unten ein.",
-        "data": {
-          "code": "Bestätigungscode"
+          "api_key": "API-Schlüssel"
         }
       },
       "entity_selection": {
